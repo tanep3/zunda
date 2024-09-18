@@ -3,6 +3,7 @@
 
 # VOICEVOXエンジンのURLを設定します
 VOICEVOX_ENGINE_HOST="127.0.0.1" #ご自身の環境にあわせて変更してください。
+て変更してください。
 VOICEVOX_ENGINE_PORT="50021"
 VOICEVOX_ENGINE_URL="http://${VOICEVOX_ENGINE_HOST}:${VOICEVOX_ENGINE_PORT}"
 
@@ -24,17 +25,18 @@ POST_PHONEME_LENGTH=""
 PAUSE_LENGTH_SCALE=""
 SAMPLING_RATE=8000
 FORMAT="wav"
-INPUT_ENCODING="utf-8"
 LOG_FILE="zunda.log"
 LOG_OUTPUT=false
 SENTENCE_INTERVAL=0.5
+MAX_JOBS=4   # 並列実行する最大プロセス数
 
 usage() {
     echo "使用法: $0 [オプション] [\"テキストを入力してください\"]" >&2
+    echo "  -i, --input FILE           テキストファイルを指定します" >&2
     echo "  -o, --output FILE          出力ファイル名を指定します(対応ファイルは wav,mp3,aac,ogg)" >&2
     echo "      --stdout               音声データを標準出力に出力します" >&2
-    echo "  -i, --input FILE           テキストファイルを指定します" >&2
-    echo "  -s, --speaker ID           スピーカーIDを指定します（デフォルト: $SPEAKER_ID）" >&2
+    echo "  -m, --multi-process        並行処理させるプロセス数を指定します（デフォルト:""$MAX_JOBS""）" >&2
+    echo "  -s, --speaker ID           スピーカーIDを指定します（デフォルト:""$SPEAKER_ID""）" >&2
     echo "  -l, --list-speakers        利用可能なスピーカーの一覧を表示します" >&2
     echo "      --speaker-info ID      指定したスピーカーIDの情報を表示します" >&2
     echo "  -v, --version              VOICEVOXエンジンのバージョンを表示します" >&2
@@ -45,9 +47,9 @@ usage() {
     echo "      --pre-phoneme-length FLOAT   音声の前の無音時間を指定します（秒）" >&2
     echo "      --post-phoneme-length FLOAT  音声の後の無音時間を指定します（秒）" >&2
     echo "      --pause-length-scale FLOAT   句読点などの無音時間の倍率を指定します" >&2
-    echo "      --sampling-rate INTEGER      音声データの出力サンプリングレートを指定します（Hz）（デフォルト: $SAMPLING_RATE Hz）" >&2
-    echo "      --sentence-interval FLOAT    ファイル出力時の句読点の無音時間（秒)（デフォルト：$SENTENCE_INTERVAL秒）"
-    echo "      --log [FILE]             ログファイルを指定します。（デフォルト: $LOG_FILE）" >&2
+    echo "      --sampling-rate INTEGER      音声データの出力サンプリングレートを指定します（デフォルト:""$SAMPLING_RATE""Hz）" >&2
+    echo "      --sentence-interval FLOAT    ファイル出力時の句読点の無音時間（秒)（デフォルト:""$SENTENCE_INTERVAL""秒）"
+    echo "      --log [FILE]             ログファイルを指定します。（デフォルト:""$LOG_FILE""）" >&2
     echo "  -h, --help                 このヘルプメッセージを表示します" >&2
     exit 1
 }
@@ -111,7 +113,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --stdout)
             USE_STDOUT=true
-            exec 2> >(cat >&2)
+            # exec 2> >(cat >&2)
             shift
             ;;
         -i|--input)
@@ -121,6 +123,15 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo "エラー: -i オプションにはテキストファイル名が必要です。" >&2
+                usage
+            fi
+            ;;
+        -m|--multi-process)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                MAX_JOBS="$2"
+                shift 2
+            else
+                echo "エラー: -m オプションにはプロセス数が必要です。" >&2
                 usage
             fi
             ;;
@@ -246,57 +257,91 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 使用環境がWindowsかどうかを検出
-is_windows=false
-if [[ "$(uname -s)" == *"MINGW"* ]] || [[ "$(uname -s)" == *"CYGWIN"* ]]; then
-    is_windows=true
-fi
-
-# 一時的なファイルを作る関数
-make_tempfile() {
-    if [ "$is_windows" = true ]; then
-        temp_file=$(mktemp)
-        cygpath -w "$temp_file"
-    else
-        mktemp
-    fi
-}
-
 # 入力ファイルのエンコーディングを確認する関数
 check_input_enc() {
     input="$1"
     temp_file=$(make_tempfile)
-
     # 入力がファイルかどうかを確認
     if [ -f "$input" ]; then
         # ファイルの場合はそのまま処理
-        head -c 64 "$input" > "$temp_file"
+        file_name="$1"
     else
         # テキストの場合はそのまま一時ファイルに保存
-        echo "$input" | head -c 64 > "$temp_file"
+        echo "$input" > "$temp_file"
+        file_name="temp_file"
     fi
-
     # エンコーディングを判定
-    INPUT_ENCODING=$(file -i "$temp_file" | awk -F "=" '{print $2}')
-
+    param="-i"
+    if [ "$(uname)" == "Darwin" ]; then   # Macだった場合
+        param="-I"
+    fi
+    input_encoding=$(file "$param" "$file_name" | awk -F "=" '{print $2}')
+    if [ $? -ne 0 ]; then
+        echo "エラー: 入力の文字コード情報の取得に失敗しました。" >&2
+        trap "rm -rf '$TEMP_DIR'" EXIT
+        exit 1
+    fi
     # 一時ファイルを削除
     rm -f "$temp_file"
-
     # エンコーディング情報を出力
-    log "判定されたエンコーディング: $INPUT_ENCODING"
+    echo "$input_encoding"
 }
 
-# ヘルパー関数: 必要に応じてUTF-8に変換
+# 必要に応じてUTF-8に変換
 to_utf8() {
+    if [ -z "$2" ]; then
+        INPUT_ENCODING="utf-8"
+    else
+        if [ "$2" == "unknown-8bit" ]; then
+            # たぶんShift-JISコード。勘で変換する。
+            INPUT_ENCODING="SHIFT-JIS"
+        else
+            INPUT_ENCODING="$2"
+        fi
+    fi
     # 判定されたエンコーディングが UTF-8 以外なら変換
     if [[ "$(uname -s)" == *"MINGW"* || "$(uname -s)" == *"CYGWIN"* || "$INPUT_ENCODING" != "utf-8" ]]; then
         # iconv で UTF-8 に変換
-        temp_enced_data=$(echo "$1" | iconv -f "$INPUT_ENCODING" -t "utf-8")
-        echo "$temp_enced_data"
+        if [ -f "$1" ]; then
+            (iconv -f "$INPUT_ENCODING" -t "utf-8" "$1")
+            if [ $? -ne 0 ]; then
+                echo "エラー: 入力の文字コード変換に失敗しました。" >&2
+                rm -f "$TEXTS"
+                exit 1
+            fi
+        else
+            echo "$(echo "$1" | iconv -f "$INPUT_ENCODING" -t "utf-8")"
+            if [ $? -ne 0 ]; then
+                echo "エラー: 入力の文字コード変換に失敗しました。" >&2
+                trap "rm -rf '$TEMP_DIR'" EXIT
+                exit 1
+            fi
+        fi
     else
         # すでに UTF-8 ならそのまま出力
-        echo "$1"
+        if [ -f "$1" ]; then
+            cat "$1"
+        else
+            echo "$1"
+        fi
     fi
+}
+
+# 文章をフレーズごとに分割する
+parted_sentence() {
+    # 標準入力の内容を1行ずつ読み込んで配列に格納
+    while IFS= read -r line || [[ -n $line ]]; do
+        # 句読点、ピリオド、コロン、スペースで分割
+        IFS=$'、。、:： 　¥n' read -ra parts <<< "$line"
+        for part in "${parts[@]}"; do
+            # 句読点、スペース、コロン、ピリオド、改行コードを削除
+            trimmed=$(echo "$part" | sed 's/^\(\xEF\xBB\xBF\|[[:space:]。、:： 　.\n]\)*//g')
+            # 空行や不要な分割結果は無視して配列に追加
+            if [ -n "$trimmed" ]; then
+                echo "$trimmed"
+            fi
+        done
+    done
 }
 
 # バージョン情報の表示
@@ -343,32 +388,63 @@ if [ -n "$SPEAKER_INFO" ]; then
     exit 0
 fi
 
+# 一時ディレクトリを作成
+prefix=$(LC_ALL=C tr -dc A-Za-z0-9 < /dev/urandom | head -c 8)
+temp_dir="/tmp/tmp_zunda_${prefix}/"
+TEMP_DIR="$temp_dir"
+mkdir "$TEMP_DIR"
+
+# 一時的なファイルを作る関数
+make_tempfile() {
+    prefix=$(LC_ALL=C tr -dc A-Za-z0-9 < /dev/urandom | head -c 8)
+    echo "${TEMP_DIR}tmp_${prefix}"
+}
+
+get_real_filename() {
+# 使用環境がWindowsかどうかを検出
+if [[ "$(uname -s)" == *"MINGW"* ]] || [[ "$(uname -s)" == *"CYGWIN"* ]]; then
+    # curlの保存先と、ffmpegのファイルアクセスが、Windowsのディレクトリ書式じゃないと動かないみたいなんっすよ汗。
+    # Windowsの場合はCygwinのcygpathを使う
+    cygpath -w "$1"
+else
+    echo "$1"
+fi
+}
+
 # テキストの取得
-TEXTS=()
+TEXTS=$(make_tempfile)
 
 # 標準入力から読み込む
-input_text=""
+std_input=""
 if [ "$USE_STDIN" == true ]; then
     # パイプやリダイレクトの入力
     if [ ! -t 0 ]; then
-        input_text=$(cat)
+        std_input=$(make_tempfile)
+        cat > "$std_input"
+        log "標準パイプ入力です"
     elif [ -t 0 ]; then
         echo "【標準入力モードです。テキストを入力してください（Ctrl+Dで終了）】" >&2
-        input_text=$(cat)
+        std_input=$(make_tempfile)
+        cat > "$std_input"
         echo
         echo "【変換中】" >&2
     fi
 else
     # パイプやリダイレクトの入力
     if [ ! -t 0 ]; then
-        input_text=$(cat)
+        log "標準パイプ入力です"
+        std_input=$(make_tempfile)
+        cat > "$std_input"
+    else
+        log "標準入力はありません"
     fi
 fi
 # 標準入力のテキストを UTF-8 に変換して配列に格納
-if [ -n "$input_text" ]; then
-    check_input_enc "$input_text"
-    utf8_text=$(to_utf8 "$input_text")
-    mapfile -t TEXTS <<< "$utf8_text"
+if [ -n "$std_input" ]; then
+    temp_enc="$(check_input_enc "$std_input")"
+    utf8_text=$(to_utf8 "$std_input" "$temp_enc")
+    (echo "$utf8_text" | parted_sentence >> "$TEXTS")
+    rm -f "$std_input"
     log "標準入力からテキストを読み込みました。"
 fi
 
@@ -376,194 +452,165 @@ fi
 if [ ${#ARGS[@]} -gt 0 ]; then
      # コマンドライン引数を UTF-8 に変換してから配列に格納
     for arg in "${ARGS[@]}"; do
-        check_input_enc "$arg"
-        TEXTS+=("$(to_utf8 "$arg")")
+        temp_enc="$(check_input_enc "$input_text")"
+        utf8_text=$(to_utf8 "$arg" "$temp_enc")
+        (echo "$utf8_text" | parted_sentence >> "$TEXTS")
+
     done
     log "コマンドライン引数からテキストを取得しました。"
 fi
 
-# ファイルから読み込む
-file_to_array() {
-    # 一時ファイルの内容を1行ずつ読み込んで配列に格納
-    while IFS= read -r line || [[ -n $line ]]; do
-        # 句読点、ピリオド、コロン、スペースで分割
-        IFS=$'、。、:： 　' read -ra parts <<< "$line"
-        for part in "${parts[@]}"; do
-            # 句読点、スペース、コロン、ピリオド、改行コードを削除
-            trimmed=$(echo "$part" | sed 's/^\(\xEF\xBB\xBF\|[[:space:]。、:： 　.\n]\)*//g')
-            # 空行や不要な分割結果は無視して配列に追加
-            if [ -n "$trimmed" ]; then
-                TEXTS+=("$trimmed")
-            fi
-        done
-    done < "$1"
-}
 if [ -n "$TEXT_FILE" ]; then
     if [ -f "$TEXT_FILE" ]; then
         # エンコーディングを確認
-        check_input_enc "$TEXT_FILE"
-        if [ "$INPUT_ENCODING" == "utf-8" ]; then
-            file_to_array "$TEXT_FILE"
-        else
-             # 一時ファイルを使用して変換結果を保存
-            temp_utf8_file=$(mktemp)
-            iconv -f "$INPUT_ENCODING" -t "utf-8" "$TEXT_FILE" > "$temp_utf8_file"
-            file_to_array "$temp_utf8_file"
-            # 一時ファイルを削除
-            rm -f "$temp_utf8_file"
-            log "ファイルをutf-8に変換しました。"
-        fi
+        temp_enc="$(check_input_enc "$TEXT_FILE")"
+        utf8_text=$(to_utf8 "$TEXT_FILE" "$temp_enc")
+        (echo "$utf8_text" | parted_sentence >> "$TEXTS")
         log "テキストファイルからテキストを読み込みました: $TEXT_FILE"
     else
         echo "エラー: テキストファイル '$TEXT_FILE' が見つかりません。" >&2
         log "エラー: テキストファイル '$TEXT_FILE' が見つかりません。"
+        trap "rm -rf '$TEMP_DIR'" EXIT
         exit 1
     fi
 fi
 
-if [ "$USE_STDOUT" = true ] || [ -n "$OUTPUT" ]; then
-    # 標準出力、ファイル出力がある場合は、各バッチをまとめて１本で出力する。
-    # バッチ内で生成される各中間ファイルは FILE_LIST 変数により管理する。
-    FILE_LIST=()
-fi
+current_job_count=0 # 並行稼働しているジョブの数
+job_num=0  # 現在のジョブ番号を管理する変数
 # 音声合成の実行
-for TEXT in "${TEXTS[@]}"; do
-    log "音声合成を開始します: $TEXT"
-    # audio_query の結果を取得
-    QUERY_JSON=$(curl -s -f -X POST "$VOICEVOX_ENGINE_URL/audio_query" \
-        --get --data-urlencode "text=$TEXT" \
-        --data-urlencode "speaker=$SPEAKER_ID")
-    if [ $? -ne 0 ]; then
-        echo "エラー: audio_query API の呼び出しに失敗しました。" >&2
-        log "エラー: audio_query API の呼び出しに失敗しました。"
-        exit 1
-    fi
+while read -r TEXT; do
+    (
+        echo "$TEXT" >&2
+        log "音声合成を開始します: $TEXT"
+        # audio_query の結果を取得
+        QUERY_JSON=$(curl -s -f -X POST "$VOICEVOX_ENGINE_URL/audio_query" \
+            --get --data-urlencode "text=$TEXT" \
+            --data-urlencode "speaker=$SPEAKER_ID")
+        if [ $? -ne 0 ]; then
+            echo "エラー: audio_query API の呼び出しに失敗しました。" >&2
+            log "エラー: audio_query API の呼び出しに失敗しました。"
+            trap "rm -rf '$TEMP_DIR'" EXIT
+            exit 1
+        fi
 
-    # パラメータを調整
-    if [ -n "$SPEED" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".speedScale=$SPEED")
-    fi
-    if [ -n "$PITCH" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".pitchScale=$PITCH")
-    fi
-    if [ -n "$INTONATION" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".intonationScale=$INTONATION")
-    fi
-    if [ -n "$VOLUME" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".volumeScale=$VOLUME")
-    fi
-    if [ -n "$PRE_PHONEME_LENGTH" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".prePhonemeLength=$PRE_PHONEME_LENGTH")
-    fi
-    if [ -n "$POST_PHONEME_LENGTH" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".postPhonemeLength=$POST_PHONEME_LENGTH")
-    fi
-    if [ -n "$PAUSE_LENGTH_SCALE" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".pauseLengthScale=$PAUSE_LENGTH_SCALE")
-    fi
-    if [ -n "$SAMPLING_RATE" ]; then
-        QUERY_JSON=$(echo "$QUERY_JSON" | jq ".outputSamplingRate=$SAMPLING_RATE")
-    fi
-    log "$QUERY_JSON"
+        # パラメータを調整
+        if [ -n "$SPEED" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".speedScale=$SPEED")
+        fi
+        if [ -n "$PITCH" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".pitchScale=$PITCH")
+        fi
+        if [ -n "$INTONATION" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".intonationScale=$INTONATION")
+        fi
+        if [ -n "$VOLUME" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".volumeScale=$VOLUME")
+        fi
+        if [ -n "$PRE_PHONEME_LENGTH" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".prePhonemeLength=$PRE_PHONEME_LENGTH")
+        fi
+        if [ -n "$POST_PHONEME_LENGTH" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".postPhonemeLength=$POST_PHONEME_LENGTH")
+        fi
+        if [ -n "$PAUSE_LENGTH_SCALE" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".pauseLengthScale=$PAUSE_LENGTH_SCALE")
+        fi
+        if [ -n "$SAMPLING_RATE" ]; then
+            QUERY_JSON=$(echo "$QUERY_JSON" | jq ".outputSamplingRate=$SAMPLING_RATE")
+        fi
+        log "$QUERY_JSON"
 
-    if [ "$USE_STDOUT" = true ] || [ -n "$OUTPUT" ]; then
-        # ファイルに保存
-        TEMP_FILE=$(make_tempfile)
-        FILE_LIST+=("$TEMP_FILE")
+        TEMP_FILE="$TEMP_DIR$job_num.wav"
         echo "$QUERY_JSON" | \
         curl -s -f "$VOICEVOX_ENGINE_URL/synthesis?speaker=$SPEAKER_ID" \
             -H "Content-Type: application/json" \
-            -X POST -d @- -o "$TEMP_FILE"
+            -X POST -d @- -o "$(get_real_filename "$TEMP_FILE")"
         if [ $? -ne 0 ]; then
             echo "変換テキスト：$TEXT" >&2
             echo "エラー: synthesis API の呼び出しに失敗しました。" >&2
             log "変換テキスト：$TEXT"
             log "エラー: synthesis API の呼び出しに失敗しました。"
-            for item in "${FILE_LIST[@]}"; do
-                if [ -f "$item" ]; then
-                    rm "$item"
-                else
-                    echo "ファイルが存在しません: $item" >&2
-                    log "ファイルが存在しません: $item"
-                fi
-            done
+            trap "rm -rf '$TEMP_DIR'" EXIT
             exit 1
         fi
-        echo "$TEXT" >&2
-    else
-        # 音声を再生（ffplay を使用）
-        echo "$QUERY_JSON" | \
-        curl -s -f "$VOICEVOX_ENGINE_URL/synthesis?speaker=$SPEAKER_ID" \
-            -H "Content-Type: application/json" \
-            -X POST -d @- | \
-        ffplay -nodisp -autoexit -loglevel quiet -f wav - >/dev/null
-        if [ $? -ne 0 ]; then
-            echo "エラー: 音声の再生に失敗しました。" >&2
-            log "エラー: 音声の再生に失敗しました。"
-            exit 1
-        fi
-        log "音声を再生しました。"
+    ) &  # サブシェルをバックグラウンドで実行することで並列稼働させる。
+    job_num=$((job_num + 1))
+    current_job_count=$((current_job_count + 1))
+    # 最大ジョブ数に達したら、ジョブが終了するまで待機
+    if [ "$current_job_count" -ge "$MAX_JOBS" ]; then
+        wait $! # 最初に終了したジョブを待つ
+        current_job_count=$((current_job_count - 1))
     fi
+done < "$TEXTS"
+# 全てのバックグラウンドジョブが終了するのを待つ
+wait
+
+# すべての音声ファイルを結合して出力する
+echo "バックグラウンド処理が終了しました。出力します。" >&2
+log "バックグラウンド処理が終了しました。出力します。"
+# FFMPEG用のリストファイルを作成
+FFMPEG_LIST_FILE="$(make_tempfile)"
+SILENCE_FILE="$(make_tempfile).wav"
+ffmpeg -loglevel quiet -f lavfi -i anullsrc=r="$SAMPLING_RATE":cl=mono -t "$SENTENCE_INTERVAL" -y -f wav "$(get_real_filename "$SILENCE_FILE")"
+for ((i=0; i<$job_num; i++)); do
+    echo "file '$(get_real_filename "$TEMP_DIR$i.wav")'" >> "$FFMPEG_LIST_FILE"
+    echo "file '$(get_real_filename "$SILENCE_FILE")'" >> "$FFMPEG_LIST_FILE"
 done
-if [ "$USE_STDOUT" = true ] || [ -n "$OUTPUT" ]; then
-    # FFMPEG用のリストファイルを作成
-    FFMPEG_LIST_FILE=$(make_tempfile)
-    SILENCE_FILE=$(make_tempfile)
-    ffmpeg -loglevel quiet -f lavfi -i anullsrc=r="$SAMPLING_RATE":cl=mono -t "$SENTENCE_INTERVAL" -y -f wav "$SILENCE_FILE"
-    for item in "${FILE_LIST[@]}"; do
-        echo "file '$item'" >> "$FFMPEG_LIST_FILE"
-        echo "file '$SILENCE_FILE'" >> "$FFMPEG_LIST_FILE"
-    done
-    if [ "$USE_STDOUT" = true ]; then
-        # すべての音声ファイルを結合
-        ffmpeg -loglevel error -f concat -safe 0 -i "$FFMPEG_LIST_FILE" -c copy -f wav -
+
+# 標準出力の場合
+if [ "$USE_STDOUT" == true ]; then
+    ffmpeg -loglevel error -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c:a pcm_s16le -ar "$SAMPLING_RATE" -ac 1 -f wav - 
+    if [ $? -ne 0 ]; then
+        echo "エラー: ファイル出力に失敗しました。" >&2
+        log "エラー: ファイル出力に失敗しました。[code:$?]"
+    fi
+    echo "音声を標準出力しました。" >&2
+    log "音声を標準出力しました。"
+fi
+
+# ファイル出力の場合
+if [ -n "$OUTPUT" ]; then
+    if [ "$FORMAT" == "wav" ]; then
+        ffmpeg -loglevel error -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c:a pcm_s16le -ar "$SAMPLING_RATE" -ac 1 -f wav "$(get_real_filename "$OUTPUT")"
         if [ $? -ne 0 ]; then
             echo "エラー: ファイル出力に失敗しました。" >&2
             log "エラー: ファイル出力に失敗しました。[code:$?]"
         fi
-        echo "音声を標準出力しました。" >&2
-        log "音声を標準出力しました。"
-    fi
-    if [ -n "$OUTPUT" ]; then
-        # すべての音声ファイルを結合
-        if [ "$FORMAT" == "wav" ]; then
-            ffmpeg -loglevel error -f concat -safe 0 -i "$FFMPEG_LIST_FILE" -c copy "$OUTPUT"
-            if [ $? -ne 0 ]; then
-                echo "エラー: ファイル出力に失敗しました。" >&2
-                log "エラー: ファイル出力に失敗しました。[code:$?]"
-            fi
-        elif [ "$FORMAT" == "mp3" ]; then
-            ffmpeg -loglevel error -f concat -safe 0 -i "$FFMPEG_LIST_FILE" -c:a libmp3lame -ar "$SAMPLING_RATE" -ac 1 -qscale:a 2 "$OUTPUT"
-            if [ $? -ne 0 ]; then
-                echo "エラー: ファイル出力に失敗しました。" >&2
-                log "エラー: ファイル出力に失敗しました。[code:$?]"
-            fi
-        elif [ "$FORMAT" == "ogg" ]; then
-            ffmpeg -loglevel error -f concat -safe 0 -i "$FFMPEG_LIST_FILE" -c:a libvorbis -ar "$SAMPLING_RATE" -ac 1 -qscale:a 2 "$OUTPUT"
-            if [ $? -ne 0 ]; then
-                echo "エラー: ファイル出力に失敗しました。" >&2
-                log "エラー: ファイル出力に失敗しました。[code:$?]"
-            fi
-        elif [ "$FORMAT" == "aac" ]; then
-            ffmpeg -loglevel error -f concat -safe 0 -i "$FFMPEG_LIST_FILE" -c:a aac -ar "$SAMPLING_RATE" -ac 1 -b:a 128k "$OUTPUT"
-            if [ $? -ne 0 ]; then
-                echo "エラー: ファイル出力に失敗しました。" >&2
-                log "エラー: ファイル出力に失敗しました。[code:$?]"
-            fi
-        else
-            echo "サポートされていないフォーマット: $FORMAT" >&2
-            log "サポートされていないフォーマット: $FORMAT"
+    elif [ "$FORMAT" == "mp3" ]; then
+        ffmpeg -loglevel error -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c:a libmp3lame -ar "$SAMPLING_RATE" -ac 1 -qscale:a 2 "$(get_real_filename "$OUTPUT")"
+        if [ $? -ne 0 ]; then
+            echo "エラー: ファイル出力に失敗しました。" >&2
+            log "エラー: ファイル出力に失敗しました。[code:$?]"
         fi
-        echo "音声を $OUTPUT に保存しました。" >&2
-        log "音声を $OUTPUT に保存しました。"
-    fi
-    for item in "${FILE_LIST[@]}"; do
-        if [ -f "$item" ]; then
-            rm "$item"
-        else
-            echo "ファイルが存在しません: $item" >&2
+    elif [ "$FORMAT" == "ogg" ]; then
+        ffmpeg -loglevel error -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c:a libvorbis -ar "$SAMPLING_RATE" -ac 1 -qscale:a 2 "$(get_real_filename "$OUTPUT")"
+        if [ $? -ne 0 ]; then
+            echo "エラー: ファイル出力に失敗しました。" >&2
+            log "エラー: ファイル出力に失敗しました。[code:$?]"
         fi
-    done
-    rm "$SILENCE_FILE"
-    rm "$FFMPEG_LIST_FILE"
+    elif [ "$FORMAT" == "aac" ]; then
+        ffmpeg -loglevel error -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c:a aac -ar "$SAMPLING_RATE" -ac 1 -b:a 128k "$(get_real_filename "$OUTPUT")"
+        if [ $? -ne 0 ]; then
+            echo "エラー: ファイル出力に失敗しました。" >&2
+            log "エラー: ファイル出力に失敗しました。[code:$?]"
+        fi
+    else
+        echo "サポートされていないフォーマット: $FORMAT" >&2
+        log "サポートされていないフォーマット: $FORMAT"
+    fi
+    echo "音声を $OUTPUT に保存しました。" >&2
+    log "音声を $OUTPUT に保存しました。"
 fi
+
+# 通常音声出力の場合
+if [ "$USE_STDOUT" == false ] && [ -z "$OUTPUT" ]; then
+    ffmpeg -loglevel quiet -f concat -safe 0 -i "$(get_real_filename "$FFMPEG_LIST_FILE")" -c copy -f wav pipe:1 | ffplay -nodisp -autoexit -loglevel quiet -f wav - >/dev/null
+    if [ $? -ne 0 ]; then
+        echo "エラー: 音声の再生に失敗しました。" >&2
+        log "エラー: 音声の再生に失敗しました。"
+    else
+        log "音声を再生しました。"
+    fi
+fi
+# スクリプト終了時に一時ディレクトリを削除
+trap "rm -rf '$TEMP_DIR'" EXIT
