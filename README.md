@@ -67,6 +67,16 @@
       echo "こんにちは" | zunda
       ```
 
+入力テキストは既定で UTF-8 として読み込みます。Shift-JIS や EUC-JP の
+ファイル・標準入力を使う場合は文字コードを明示してください。
+
+    zunda --input-encoding SHIFT-JIS -i text.txt -o voice.wav
+    cat text.txt | zunda --input-encoding EUC-JP -o voice.wav
+
+複数の入力を指定した場合は、標準入力、コマンド引数、ファイルの順に
+連結します。コマンド引数は UTF-8 として扱います。UTF-8 でない入力を
+指定なしで渡した場合は、誤変換を避けるためエラーで停止します。
+
 3. **ファイルに出力**
 
    音声ファイルフォーマットは、ファイル名に指定した拡張子で自動認識します。

@@ -3,13 +3,13 @@
 
 # VOICEVOXエンジンのURLを設定します
 VOICEVOX_ENGINE_HOST="127.0.0.1" #ご自身の環境にあわせて変更してください。
-て変更してください。
 VOICEVOX_ENGINE_PORT="50021"
 VOICEVOX_ENGINE_URL="http://${VOICEVOX_ENGINE_HOST}:${VOICEVOX_ENGINE_PORT}"
 
 OUTPUT=""
 TEXT=""
 TEXT_FILE=""
+INPUT_ENCODING=""
 USE_STDIN=true
 USE_STDOUT=false
 SPEAKER_ID=3
@@ -33,6 +33,7 @@ MAX_JOBS=4   # 並列実行する最大プロセス数
 usage() {
     echo "使用法: $0 [オプション] [\"テキストを入力してください\"]" >&2
     echo "  -i, --input FILE           テキストファイルを指定します" >&2
+    echo "      --input-encoding NAME  ファイル・標準入力の文字コード（例: SHIFT-JIS, EUC-JP）" >&2
     echo "  -o, --output FILE          出力ファイル名を指定します(対応ファイルは wav,mp3,aac,ogg)" >&2
     echo "      --stdout               音声データを標準出力に出力します" >&2
     echo "  -m, --multi-process        並行処理させるプロセス数を指定します（デフォルト:""$MAX_JOBS""）" >&2
@@ -109,6 +110,15 @@ while [[ $# -gt 0 ]]; do
             else
                 echo "エラー: -o オプションにはファイル名が必要です。" >&2
                 usage
+            fi
+            ;;
+        --input-encoding)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                INPUT_ENCODING="$2"
+                shift 2
+            else
+                echo "エラー: --input-encoding に文字コードを指定してください。" >&2
+                exit 1
             fi
             ;;
         --stdout)
@@ -257,74 +267,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 入力ファイルのエンコーディングを確認する関数
-check_input_enc() {
-    input="$1"
-    temp_file=$(make_tempfile)
-    # 入力がファイルかどうかを確認
-    if [ -f "$input" ]; then
-        # ファイルの場合はそのまま処理
-        file_name="$1"
-    else
-        # テキストの場合はそのまま一時ファイルに保存
-        echo "$input" > "$temp_file"
-        file_name="temp_file"
+# UTF-8 is the default. Other encodings require an explicit option;
+# silently guessing Japanese encodings can corrupt valid text.
+convert_input() {
+    local input_file="$1" output_file="$2" encoding="$3"
+    if [ ! -s "$input_file" ]; then
+        : > "$output_file"
+        return 0
     fi
-    # エンコーディングを判定
-    param="-i"
-    if [ "$(uname)" == "Darwin" ]; then   # Macだった場合
-        param="-I"
+    if [ -z "$encoding" ]; then
+        if ! iconv -f UTF-8 -t UTF-8 "$input_file" > "$output_file" 2>/dev/null; then
+            echo "エラー: 入力は有効な UTF-8 ではありません。--input-encoding を指定してください。" >&2
+            return 1
+        fi
+    elif ! iconv -f "$encoding" -t UTF-8 "$input_file" > "$output_file"; then
+        echo "エラー: 入力の文字コード変換に失敗しました ($encoding)。" >&2
+        return 1
     fi
-    input_encoding=$(file "$param" "$file_name" | awk -F "=" '{print $2}')
-    if [ $? -ne 0 ]; then
-        echo "エラー: 入力の文字コード情報の取得に失敗しました。" >&2
-        trap "rm -rf '$TEMP_DIR'" EXIT
-        exit 1
-    fi
-    # 一時ファイルを削除
-    rm -f "$temp_file"
-    # エンコーディング情報を出力
-    echo "$input_encoding"
 }
 
-# 必要に応じてUTF-8に変換
+# Some informational output is already UTF-8.
 to_utf8() {
-    if [ -z "$2" ]; then
-        INPUT_ENCODING="utf-8"
-    else
-        if [ "$2" == "unknown-8bit" ]; then
-            # たぶんShift-JISコード。勘で変換する。
-            INPUT_ENCODING="SHIFT-JIS"
-        else
-            INPUT_ENCODING="$2"
-        fi
-    fi
-    # 判定されたエンコーディングが UTF-8 以外なら変換
-    if [[ "$(uname -s)" == *"MINGW"* || "$(uname -s)" == *"CYGWIN"* || "$INPUT_ENCODING" != "utf-8" ]]; then
-        # iconv で UTF-8 に変換
-        if [ -f "$1" ]; then
-            (iconv -f "$INPUT_ENCODING" -t "utf-8" "$1")
-            if [ $? -ne 0 ]; then
-                echo "エラー: 入力の文字コード変換に失敗しました。" >&2
-                rm -f "$TEXTS"
-                exit 1
-            fi
-        else
-            echo "$(echo "$1" | iconv -f "$INPUT_ENCODING" -t "utf-8")"
-            if [ $? -ne 0 ]; then
-                echo "エラー: 入力の文字コード変換に失敗しました。" >&2
-                trap "rm -rf '$TEMP_DIR'" EXIT
-                exit 1
-            fi
-        fi
-    else
-        # すでに UTF-8 ならそのまま出力
-        if [ -f "$1" ]; then
-            cat "$1"
-        else
-            echo "$1"
-        fi
-    fi
+    printf '%s\n' "$1"
 }
 
 # 文章をフレーズごとに分割する
@@ -332,13 +296,13 @@ parted_sentence() {
     # 標準入力の内容を1行ずつ読み込んで配列に格納
     while IFS= read -r line || [[ -n $line ]]; do
         # 句読点、ピリオド、コロン、スペースで分割
-        IFS=$'、。、:： 　¥n' read -ra parts <<< "$line"
+        IFS=$'、。:：　\r\n' read -ra parts <<< "$line"
         for part in "${parts[@]}"; do
             # 句読点、スペース、コロン、ピリオド、改行コードを削除
-            trimmed=$(echo "$part" | sed 's/^\(\xEF\xBB\xBF\|[[:space:]。、:： 　.\n]\)*//g')
+            trimmed=$(printf '%s\n' "$part" | sed 's/^\(\xEF\xBB\xBF\|[[:space:]。、:： 　.\n]\)*//g')
             # 空行や不要な分割結果は無視して配列に追加
             if [ -n "$trimmed" ]; then
-                echo "$trimmed"
+                printf '%s\n' "$trimmed"
             fi
         done
     done
@@ -411,68 +375,60 @@ else
 fi
 }
 
-# テキストの取得
+# All input sources are converted independently and appended in order:
+# stdin, positional arguments, then -i file (the historical order).
 TEXTS=$(make_tempfile)
+: > "$TEXTS"
+trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# 標準入力から読み込む
+append_input() {
+    local raw="$1" encoding="$2" converted
+    converted=$(make_tempfile)
+    if ! convert_input "$raw" "$converted" "$encoding"; then
+        rm -f "$converted"
+        return 1
+    fi
+    # Preserve the existing CR-removal behavior after decoding, not before.
+    tr -d '\r' < "$converted" | parted_sentence >> "$TEXTS"
+    rm -f "$converted"
+}
+
 std_input=""
-if [ "$USE_STDIN" == true ]; then
-    # パイプやリダイレクトの入力
-    if [ ! -t 0 ]; then
-        std_input=$(make_tempfile)
-        cat > "$std_input"
-        log "標準パイプ入力です"
-    elif [ -t 0 ]; then
+if [ "$USE_STDIN" == true ] || [ ! -t 0 ]; then
+    std_input=$(make_tempfile)
+    if [ -t 0 ]; then
         echo "【標準入力モードです。テキストを入力してください（Ctrl+Dで終了）】" >&2
-        std_input=$(make_tempfile)
-        cat > "$std_input"
-        echo
-        echo "【変換中】" >&2
     fi
-else
-    # パイプやリダイレクトの入力
-    if [ ! -t 0 ]; then
-        log "標準パイプ入力です"
-        std_input=$(make_tempfile)
-        cat > "$std_input"
-    else
-        log "標準入力はありません"
-    fi
-fi
-# 標準入力のテキストを UTF-8 に変換して配列に格納
-if [ -n "$std_input" ]; then
-    temp_enc="$(check_input_enc "$std_input")"
-    utf8_text=$(to_utf8 "$std_input" "$temp_enc")
-    (echo "$utf8_text" | parted_sentence >> "$TEXTS")
-    rm -f "$std_input"
-    log "標準入力からテキストを読み込みました。"
-fi
-
-# コマンドパラメタから読み込む
-if [ ${#ARGS[@]} -gt 0 ]; then
-     # コマンドライン引数を UTF-8 に変換してから配列に格納
-    for arg in "${ARGS[@]}"; do
-        temp_enc="$(check_input_enc "$input_text")"
-        utf8_text=$(to_utf8 "$arg" "$temp_enc")
-        (echo "$utf8_text" | parted_sentence >> "$TEXTS")
-
-    done
-    log "コマンドライン引数からテキストを取得しました。"
-fi
-
-if [ -n "$TEXT_FILE" ]; then
-    if [ -f "$TEXT_FILE" ]; then
-        # エンコーディングを確認
-        temp_enc="$(check_input_enc "$TEXT_FILE")"
-        utf8_text=$(to_utf8 "$TEXT_FILE" "$temp_enc")
-        (echo "$utf8_text" | parted_sentence >> "$TEXTS")
-        log "テキストファイルからテキストを読み込みました: $TEXT_FILE"
-    else
-        echo "エラー: テキストファイル '$TEXT_FILE' が見つかりません。" >&2
-        log "エラー: テキストファイル '$TEXT_FILE' が見つかりません。"
-        trap "rm -rf '$TEMP_DIR'" EXIT
+    cat > "$std_input"
+    if ! append_input "$std_input" "$INPUT_ENCODING"; then
         exit 1
     fi
+    rm -f "$std_input"
+fi
+
+# Arguments are passed by the shell as UTF-8 bytes, not filenames.
+for arg in "${ARGS[@]}"; do
+    arg_file=$(make_tempfile)
+    printf '%s' "$arg" > "$arg_file"
+    if ! append_input "$arg_file" "UTF-8"; then
+        exit 1
+    fi
+    rm -f "$arg_file"
+done
+
+if [ -n "$TEXT_FILE" ]; then
+    if [ ! -f "$TEXT_FILE" ]; then
+        echo "エラー: テキストファイル '$TEXT_FILE' が見つかりません。" >&2
+        exit 1
+    fi
+    if ! append_input "$TEXT_FILE" "$INPUT_ENCODING"; then
+        exit 1
+    fi
+fi
+
+if [ ! -s "$TEXTS" ]; then
+    echo "エラー: 読み上げるテキストがありません。" >&2
+    exit 1
 fi
 
 current_job_count=0 # 並行稼働しているジョブの数
