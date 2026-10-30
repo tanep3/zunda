@@ -14,6 +14,11 @@ import json, os, sys, wave
 a = sys.argv[1:]
 if any('/audio_query' in x for x in a):
     text = next(x[5:] for x in a if x.startswith('text='))
+    meta = {'url': next(x for x in a if '/audio_query' in x),
+            'speaker': next(x[8:] for x in a if x.startswith('speaker='))}
+    with open(os.environ['ZUNDA_TEST_META'], 'a', encoding='utf-8') as f:
+        f.write(json.dumps(meta) + chr(10))
+
     with open(os.environ['ZUNDA_TEST_LOG'], 'a', encoding='utf-8') as f:
         f.write(json.dumps(text, ensure_ascii=False) + '\\n')
     print('{}')
@@ -44,6 +49,9 @@ class Inputs(unittest.TestCase):
         self.env["PATH"] = str(self.fake) + os.pathsep + self.env["PATH"]
         self.env["ZUNDA_TEST_LOG"] = str(self.log)
         self.env["LC_ALL"] = "C.UTF-8"
+        self.env["HOME"] = str(self.root)
+        self.env.pop("XDG_CONFIG_HOME", None)
+        self.env["ZUNDA_TEST_META"] = str(self.root / "metadata.jsonl")
 
     def run_zunda(self, *args, data=b"", success=True):
         command = ["bash", str(SCRIPT), "-m", "1", "--sentence-interval", "0.01",
@@ -64,6 +72,48 @@ class Inputs(unittest.TestCase):
         if not self.log.exists():
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def metadata(self):
+        return [json.loads(line) for line in (self.root / "metadata.jsonl").read_text().splitlines()]
+
+    def config(self, *lines):
+        config = self.root / ".config" / "zunda" / "config"
+        config.parent.mkdir(parents=True)
+        config.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+
+    def test_defaults_without_config(self):
+        self.run_zunda('確認')
+        self.assertEqual(self.metadata()[0]["url"], "http://127.0.0.1:50021/audio_query")
+        self.assertEqual(self.metadata()[0]["speaker"], "3")
+
+    def test_config_connection_and_speaker(self):
+        self.config("VOICEVOX_ENGINE_HOST=localhost", "VOICEVOX_ENGINE_PORT=54321", "SPEAKER_ID=71")
+        self.run_zunda('確認')
+        self.assertEqual(self.metadata()[0]["url"], "http://localhost:54321/audio_query")
+        self.assertEqual(self.metadata()[0]["speaker"], "71")
+
+    def test_cli_speaker_overrides_config(self):
+        self.config("SPEAKER_ID=71")
+        self.run_zunda('--speaker', '9', '確認')
+        self.assertEqual(self.metadata()[0]["speaker"], "9")
+
+    def test_xdg_config_location(self):
+        config = self.root / "xdg" / "zunda" / "config"
+        config.parent.mkdir(parents=True)
+        config.write_text("SPEAKER_ID=27" + chr(10))
+        self.env["XDG_CONFIG_HOME"] = str(self.root / "xdg")
+        self.run_zunda('確認')
+        self.assertEqual(self.metadata()[0]["speaker"], "27")
+
+    def test_cli_encoding_overrides_config(self):
+        self.config("INPUT_ENCODING=EUC-JP")
+        self.run_zunda('--input-encoding', 'SHIFT-JIS', data='日本語'.encode('shift_jis'))
+        self.assertEqual(self.requests(), ['日本語'])
+
+    def test_repo_has_no_user_home_path(self):
+        root = SCRIPT.parents[1]
+        for file in [SCRIPT, root / "README.md"]:
+            self.assertNotRegex(file.read_text(encoding="utf-8"), r"/home/[A-Za-z0-9._-]+")
 
     def test_utf8_file_and_empty_stdin(self):
         f = self.root / "日本語.txt"

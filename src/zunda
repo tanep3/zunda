@@ -1,10 +1,9 @@
 #!/bin/bash
 # ずんだもんが喋ります。
 
-# VOICEVOXエンジンのURLを設定します
-VOICEVOX_ENGINE_HOST="127.0.0.1" #ご自身の環境にあわせて変更してください。
+# VOICEVOXエンジンの既定接続先（個人設定で変更できます）
+VOICEVOX_ENGINE_HOST="127.0.0.1"
 VOICEVOX_ENGINE_PORT="50021"
-VOICEVOX_ENGINE_URL="http://${VOICEVOX_ENGINE_HOST}:${VOICEVOX_ENGINE_PORT}"
 
 OUTPUT=""
 TEXT=""
@@ -29,6 +28,16 @@ LOG_FILE="zunda.log"
 LOG_OUTPUT=false
 SENTENCE_INTERVAL=0.5
 MAX_JOBS=4   # 並列実行する最大プロセス数
+
+# Personal defaults are outside the Git checkout. CLI options below override them.
+ZUNDA_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/zunda/config"
+if [ -f "$ZUNDA_CONFIG" ]; then
+    if ! source "$ZUNDA_CONFIG"; then
+        echo "エラー: zunda 設定ファイルを読み込めません。" >&2
+        exit 1
+    fi
+fi
+VOICEVOX_ENGINE_URL="http://${VOICEVOX_ENGINE_HOST}:${VOICEVOX_ENGINE_PORT}"
 
 usage() {
     echo "使用法: $0 [オプション] [\"テキストを入力してください\"]" >&2
